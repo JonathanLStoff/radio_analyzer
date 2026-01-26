@@ -405,12 +405,13 @@ void loop() {
     if (digitalRead(BTN2) == LOW) break;
 
     float currentFreq = scanSteps[i];
-    int16_t state = radio.setFrequency(currentFreq);
+    
+    // Switch to RX mode
+    int16_t state = radio.startReceive();
     
     if (state == RADIOLIB_ERR_NONE) {
-      radio.startReceive();
-      delayMicroseconds(500); // 0.5ms dwell
-      float rssi = radio.getRSSI(); // Sample RSSI
+      delayMicroseconds(500); // Wait for RSSI to settle
+      float rssi = radio.getRSSI(); 
       rssiData[i] = rssi;
       
       // Update max for this sweep
@@ -419,10 +420,35 @@ void loop() {
         maxRssiFreq = currentFreq;
       }
 
-      // Check for strong signal to log
-      if (rssi > RSSI_THRESHOLD_DBM) {
+      // DATA SNIFFER LOGIC
+      // If signal is strong (> -60dBm), stop and try to read the packet!
+      if (rssi > -60.0) {
+          digitalWrite(LED_PIN_B, HIGH); // Blue indicates sniffing
+          
+          // Try to receive a packet with a 50ms timeout
+          size_t len = radio.getPacketLength(); 
+          // Note: In OOK/Raw mode, getPacketLength might be tricky, assuming variable length
+          // RadioLib's receive() is blocking.
+          String strData;
+          int16_t rxState = radio.receive(strData); 
+          
+          if (rxState == RADIOLIB_ERR_NONE) {
+             // We caught data!
+             logData(currentFreq, rssi, (uint8_t*)strData.c_str(), strData.length());
+             digitalWrite(LED_PIN_G, HIGH); // Green flash for success
+             delay(50);
+             digitalWrite(LED_PIN_G, LOW);
+          } else {
+             // Just log the strong signal presence
+             logData(currentFreq, rssi, nullptr, 0);
+          }
+           digitalWrite(LED_PIN_B, LOW);
+      } else if (rssi > RSSI_THRESHOLD_DBM) {
+          // Weak signal, just log RSSI
           logData(currentFreq, rssi, nullptr, 0); 
       }
+      
+      // LED Logic
       
       // LED Logic
       // Requirement: Always GREEN. 
