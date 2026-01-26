@@ -164,6 +164,7 @@ void dumpCSV() {
   File f = LittleFS.open(LOG_FILENAME, "r");
   if (f) {
     while (f.available()) {
+      rp2040.wdt_reset(); // Prevent watchdog reset during large file dumps
       Serial.write(f.read());
     }
     f.close();
@@ -178,7 +179,7 @@ void logData(float freq, float rssi, uint8_t* data, size_t len) {
   if (f) {
     f.print(freq, 2);
     f.print(",");
-    f.print(millis());
+    f.print(timestampOffset + millis());
     f.print(",");
     f.print(rssi, 1);
     f.print(",");
