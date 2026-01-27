@@ -8,17 +8,28 @@
 #include <math.h>
 
 // --- Pin Definitions ---
+// 1 (GND)=gnd
+// 2 (VDD)=3_3v
+// 3 (GDO0)=gp7
+// 4 (CSN)=gp9
+// 5 (SCK)=gp10
+// 6 (MOSI)=gp11
+// 7 (MISO/GDO1)=gp8
+// 8 (DGO2)=gp6
 constexpr int PIN_GDO0 = 7;   // CC1101 GDO0 (data ready)
-constexpr int PIN_CSN = 5;    // Chip select (CSN)
-constexpr int PIN_SCK = 2;    // SPI clock
-constexpr int PIN_MOSI = 3;   // SPI MOSI
-constexpr int PIN_MISO = 4;   // SPI MISO
-constexpr int LED_PIN_B = 12; // On-board LED BLUE
-constexpr int LED_PIN_G = 11; // On-board LED GREEN
-constexpr int LED_PIN_R = 10; // On-board LED RED
+constexpr int PIN_CSN = 9;    // Chip select (CSN)
+constexpr int PIN_SCK = 10;    // SPI clock
+constexpr int PIN_MOSI = 11;   // SPI MOSI
+constexpr int PIN_MISO = 8;   // SPI MISO
+constexpr int PIN_DGO2 = 6;   // DGO2, idk what that is
 
-constexpr int BTN1 = 8;
-constexpr int BTN2 = 9;       // Used for CSV Reset
+// On-board Tri-Color LED Pins
+constexpr int LED_PIN_B = 12; // On-board LED BLUE
+constexpr int LED_PIN_G = 2; // On-board LED GREEN
+constexpr int LED_PIN_R = 1; // On-board LED RED
+
+constexpr int BTN1 = 5;
+constexpr int BTN2 = 4;       // Used for CSV Reset
 
 // OLED Pins - I2C1 on pins 18/19
 constexpr int PIN_OLED_SDA = 18;
@@ -35,7 +46,12 @@ constexpr int PIN_OLED_SCL = 19;
 // Test transmit mode: when enabled the main loop will still iterate
 // frequencies but will transmit random payloads at full power on each.
 // Only meaningful when RADIO_ENABLED==1.
-#define TEST_TX_MODE 0  // 1 = TX test mode ON, 0 = normal receive mode
+#define TEST_TX_DEFAULT 0  // 1 = start in TX test mode, 0 = start in receive mode
+bool testTxMode = (TEST_TX_DEFAULT != 0); // runtime flag toggled by BTN1
+
+// Timestamp base: use (millis() - logBaseMillis) + logBaseOffset for CSV timestamps
+unsigned long logBaseMillis = 0;
+unsigned long logBaseOffset = 0;
 
 // --- Config Constants ---
 constexpr float SCAN_START_FREQ = 900.0f;
@@ -55,6 +71,11 @@ constexpr int RSSI_THRESHOLD_DBM = -80; // Only log signals stronger than -80 dB
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
+// Enable to probe 907.000 MHz for 5s before each sweep. If no
+// signal >= -73 dBm is found the main sweep will be skipped and a
+// debug failure will be logged.
+#define DEBUG_907 1
+
 // Display layout constants
 #define HEADER_HEIGHT 10
 #define GRAPH_TOP (HEADER_HEIGHT + 2)
@@ -63,10 +84,15 @@ constexpr int RSSI_THRESHOLD_DBM = -80; // Only log signals stronger than -80 dB
 #define NUM_BARS (SCREEN_WIDTH / BAR_WIDTH)  // 32 bars
 
 // --- Globals ---
-Module cc1101Module(PIN_CSN, PIN_GDO0, RADIOLIB_NC);
+// Provide GDO2 pin so RadioLib (and advanced CC1101 usage) can use the
+// second GDO line for interrupts/asynchronous mode.
+Module cc1101Module(PIN_CSN, PIN_GDO0, PIN_DGO2, RADIOLIB_NC, SPI1);
 CC1101 radio(&cc1101Module);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, OLED_RESET);
 bool oledReady = false;
+
+// Counters and runtime state
+int consecutiveTxErrors = 0;
 
 float scanSteps[SCREEN_WIDTH]; // Map frequencies to screen X pixels (128 freqs)
 float rssiData[SCREEN_WIDTH];
@@ -76,8 +102,8 @@ unsigned long lastSmoothMillis = 0;
 float globalMaxRssiLog = -130.0;
 float globalMaxRssiFreq = 0.0;
 unsigned long globalMaxRssiTime = 0;
-unsigned long redLedUntil = 0;
-unsigned long timestampOffset = 0;
+// redLedUntil removed — LED state is centralized via updateLedState()
+// legacy timestampOffset removed — using logBaseMillis/logBaseOffset for CSV timestamps
 unsigned long lastDisplayMs = 0;
 const unsigned long DISPLAY_UPDATE_MS = 500;
 const unsigned long MAX_TRACK_TIME_MS = 300000; // 5 minutes
@@ -88,15 +114,25 @@ const char* LOG_FILENAME = "/scan_log.csv";
 const char* LOG_FILENAME = "/scan_log_fake.csv";
 #endif
 
-// When a CSV grows above this size we'll consider storage "full" and pause
-// scanning for a while to allow user to offload/reset logs. Adjust as needed.
-#define CSV_MAX_BYTES (180 * 1024)  // 180 KB
+// Storage thresholds
+// If the filesystem has less than this many free bytes we'll consider
+// storage "low" and enter the pause behavior to avoid crashing due to full flash.
+#define STORAGE_MIN_FREE_BYTES (16 * 1024) // 16 KB
+
+// Legacy CSV size constant retained for compatibility (used only when
+// the LittleFS free/used API isn't available). Raise the fallback to 1MB to
+// avoid false positives on devices with larger flash.
+#define CSV_MAX_BYTES (1024 * 1024)  // 1 MB (fallback)
 
 
 // Forward declarations
 void logData(float freq, float rssi, uint8_t* data, size_t len);
 void renderDisplay();
 void scheduleStatus(const String &msg, unsigned long ms = 1000);
+
+// Forward-declare CSV check used by LED updater
+bool isCsvNearFull();
+void updateLedState();
 
 // Status overlay
 String pendingStatus = "";
@@ -231,14 +267,39 @@ void scheduleStatus(const String &msg, unsigned long ms) {
   statusUntil = millis() + ms;
 }
 
+// Update the tri-color LED to reflect current global state:
+// - Blue when storage full/pause
+// - Red when in TX test mode
+// - Green when in RX/normal mode
+void updateLedState() {
+  if (isCsvNearFull()) {
+    digitalWrite(LED_PIN_R, LOW);
+    digitalWrite(LED_PIN_G, LOW);
+    digitalWrite(LED_PIN_B, HIGH);
+    return;
+  }
+
+  if (testTxMode) {
+    digitalWrite(LED_PIN_R, HIGH);
+    digitalWrite(LED_PIN_G, LOW);
+    digitalWrite(LED_PIN_B, LOW);
+  } else {
+    digitalWrite(LED_PIN_R, LOW);
+    digitalWrite(LED_PIN_G, HIGH);
+    digitalWrite(LED_PIN_B, LOW);
+  }
+}
+
 void initCSV() {
-  timestampOffset = 0;
   
   if (!LittleFS.exists(LOG_FILENAME)) {
     File f = LittleFS.open(LOG_FILENAME, "w");
     if (f) {
       f.println("Freq_MHz,Timestamp_ms,RSSI_dBm,Data_Hex");
       f.close();
+      // start new logs anchored to now
+      logBaseMillis = millis();
+      logBaseOffset = 0;
       Serial.println("CSV Created - timestamp starts at 0");
     } else {
       Serial.println("Failed to create CSV");
@@ -270,9 +331,11 @@ void initCSV() {
          }
          f.close();
          if (maxTs > 0) {
-           timestampOffset = maxTs + 100;
+           // anchor new timestamps so they continue after maxTs
+           logBaseMillis = millis();
+           logBaseOffset = maxTs + 100;
          }
-         Serial.print("Resuming Log from MS: "); Serial.println(timestampOffset);
+         Serial.print("Resuming Log from MS: "); Serial.println(logBaseOffset);
       }
   }
 }
@@ -281,45 +344,94 @@ void resetCSV() {
   // Remove both possible log files to ensure a full reset
   LittleFS.remove("/scan_log.csv");
   LittleFS.remove("/scan_log_fake.csv");
-  timestampOffset = 0;
+  logBaseOffset = 0;            // new logs start from 0
+  logBaseMillis = millis();     // anchor time for new timestamps
   globalMaxRssiLog = -130.0;
   globalMaxRssiTime = 0;
 
   // After a reset, make sure the LEDs show the normal idle state
-  digitalWrite(LED_PIN_B, LOW);
-  digitalWrite(LED_PIN_R, LOW);
-  digitalWrite(LED_PIN_G, HIGH);
-
-  
+  // (updateLedState will set the appropriate LED based on mode)
   File f = LittleFS.open(LOG_FILENAME, "w");
   if (f) {
     f.println("Freq_MHz,Timestamp_ms,RSSI_dBm,Data_Hex");
     f.close();
     Serial.println("CSV Reset by User - timestamp reset to 0");
   }
-  
+
+  updateLedState();
   if (oledReady) {
       scheduleStatus("CSV RESET!", 800);
   }
   delay(500);
+  // Ensure LEDs reflect the current mode (green/red) after reset
+  updateLedState();
+}
+
+// Human-readable RadioLib error name (best-effort using defines when available)
+const char* radioErrorName(int16_t code) {
+#ifdef RADIOLIB_ERR_NONE
+  if (code == RADIOLIB_ERR_NONE) return "RADIOLIB_ERR_NONE";
+#endif
+#ifdef RADIOLIB_ERR_ANTENNA
+  if (code == RADIOLIB_ERR_ANTENNA) return "RADIOLIB_ERR_ANTENNA";
+#endif
+#ifdef RADIOLIB_ERR_SPI
+  if (code == RADIOLIB_ERR_SPI) return "RADIOLIB_ERR_SPI";
+#endif
+#ifdef RADIOLIB_ERR_TX_TIMEOUT
+  if (code == RADIOLIB_ERR_TX_TIMEOUT) return "RADIOLIB_ERR_TX_TIMEOUT";
+#endif
+#ifdef RADIOLIB_ERR_RX_TIMEOUT
+  if (code == RADIOLIB_ERR_RX_TIMEOUT) return "RADIOLIB_ERR_RX_TIMEOUT";
+#endif
+#ifdef RADIOLIB_ERR_CRC_MISMATCH
+  if (code == RADIOLIB_ERR_CRC_MISMATCH) return "RADIOLIB_ERR_CRC_MISMATCH";
+#endif
+#ifdef RADIOLIB_ERR_INVALID_STATE
+  if (code == RADIOLIB_ERR_INVALID_STATE) return "RADIOLIB_ERR_INVALID_STATE";
+#endif
+#ifdef RADIOLIB_ERR_NONE
+  (void)0; // ensure at least one define is referenced
+#endif
+  return "UNKNOWN_RADIO_ERROR";
 }
 
 // Return true if either CSV is at or above the configured threshold
 bool isCsvNearFull() {
+  // Prefer checking filesystem free space so we avoid a full flash crash.
+  // LittleFS provides totalBytes() and usedBytes() on this platform.
+  size_t total = 0;
+  size_t used = 0;
+
+  // Defensive: call available APIs if present
+  // Some LittleFS ports define totalBytes()/usedBytes(). Try using them when
+  // available; otherwise fall back to the CSV-size heuristic.
+  #if defined(LittleFS) && defined(LITTLEFS)
+    total = LittleFS.totalBytes();
+    used = LittleFS.usedBytes();
+    if (total == 0) {
+      // If the API exists but returned 0, fall back
+      Serial.println("LittleFS.totalBytes() returned 0 — falling back to file-size check");
+    } else {
+      size_t freeBytes = (total > used) ? (total - used) : 0;
+      return (freeBytes <= (size_t)STORAGE_MIN_FREE_BYTES);
+    }
+  #endif
+
+  // Fallback: approximate by summing CSV sizes (previous behavior)
   const char* filesToCheck[] = { "/scan_log.csv", "/scan_log_fake.csv" };
+  size_t totalFilesSize = 0;
   for (const char* fn : filesToCheck) {
     if (LittleFS.exists(fn)) {
       File f = LittleFS.open(fn, "r");
       if (f) {
-        size_t sz = f.size();
+        totalFilesSize += f.size();
         f.close();
-        if (sz >= CSV_MAX_BYTES) return true;
-        // Consider "nearly full" if within 1 KB of the limit
-        if (sz >= CSV_MAX_BYTES - 1024) return true;
       }
     }
   }
-  return false;
+  // If total files size exceeds CSV_MAX_BYTES, declare near full (fallback)
+  return (totalFilesSize >= CSV_MAX_BYTES);
 }
 
 void dumpCSV() {
@@ -337,25 +449,40 @@ void dumpCSV() {
   Serial.println("\n--- END CSV DUMP ---");
 }
 
+// Compute and return a timestamp suitable for CSV rows. Uses millis()-based
+// base to provide small timestamps when starting a fresh log and to resume
+// after an existing log by anchoring to previous max via logBaseOffset.
+unsigned long currentLogTimestamp() {
+  return (unsigned long)(millis() - logBaseMillis) + logBaseOffset;
+}
+
+// Log to an already-open File reference (avoids open/close per sample)
+void logData(File &f, float freq, float rssi, uint8_t* data, size_t len) {
+  if (!f) return;
+  f.print(freq, 2);
+  f.print(",");
+  unsigned long ts = currentLogTimestamp();
+  f.print(ts);
+  f.print(",");
+  f.print(rssi, 1);
+  f.print(",");
+  
+  if (data != nullptr && len > 0) {
+    for (size_t i = 0; i < len; i++) {
+      if (data[i] < 0x10) f.print("0");
+      f.print(data[i], HEX);
+    }
+  } else {
+    f.print("N/A");
+  }
+  f.println();
+}
+
+// Backwards-compatible wrapper for callers that don't have an open File
 void logData(float freq, float rssi, uint8_t* data, size_t len) {
   File f = LittleFS.open(LOG_FILENAME, "a");
   if (f) {
-    f.print(freq, 2);
-    f.print(",");
-    f.print(timestampOffset + millis());
-    f.print(",");
-    f.print(rssi, 1);
-    f.print(",");
-    
-    if (data != nullptr && len > 0) {
-      for (size_t i = 0; i < len; i++) {
-        if (data[i] < 0x10) f.print("0");
-        f.print(data[i], HEX);
-      }
-    } else {
-      f.print("N/A");
-    }
-    f.println();
+    logData(f, freq, rssi, data, len);
     f.close();
   } else {
     Serial.println("Failed to open CSV for appending");
@@ -391,8 +518,14 @@ void setup() {
   
   Serial.println("\n\n--- RADIO ANALYZER STARTING v2.3 ---");
   Serial.println("System Life Check: CLOCK TICKING");
+  // Helpful tip: CC1101 may draw peaks during TX/RX. If you observe TX errors
+  // or resets, try a different USB cable/port or add a 10uF cap across 3.3V/GND
+  // close to the radio module to reduce brownout risk.
+  Serial.println("TIP: If you see TX errors or resets, try a better USB cable/port or add a 10uF cap across 3.3V-GND on the radio module.");
 
   pinMode(PIN_GDO0, INPUT);
+  pinMode(PIN_DGO2, INPUT); // Enable GDO2 for CC1101 interrupts/asynchronous data
+  Serial.print("GDO2 configured on pin "); Serial.println(PIN_DGO2);
   pinMode(PIN_CSN, OUTPUT);
   digitalWrite(PIN_CSN, HIGH);
 
@@ -431,11 +564,13 @@ void setup() {
 #else
   oledReady = false;
   Serial.println(F("DISPLAY_DISABLED: OLED disabled at compile time."));
+  Serial.println("SETUP_LOG: after display init (DISPLAY_DISABLED)");
 #endif
 
   rp2040.wdt_reset();
 
   if (oledReady) {
+      Serial.println("SETUP_LOG: oledReady true - starting display splash");
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -465,15 +600,28 @@ void setup() {
       
       display.clearDisplay();
       display.display();
+      Serial.println("SETUP_LOG: display splash complete");
   }
+  Serial.println("SETUP_LOG: after display splash and before SPI remap");
 
-  SPI.setSCK(PIN_SCK);
-  SPI.setTX(PIN_MOSI);
-  SPI.setRX(PIN_MISO);
-  SPI.begin();
+  // REMAP SPI PINS TO MATCH HARDWARE (RP2040 / arduino-pico core)
+  // Must map SCK/MOSI/MISO and CS before calling SPI.begin() so the
+  // CC1101 sees SPI traffic on the correct GPIOs.
+  SPI1.setSCK(PIN_SCK);
+  Serial.print("SPI remapped to SCK="); Serial.print(PIN_SCK);
+  SPI1.setTX(PIN_MOSI);
+  Serial.print(" MOSI="); Serial.print(PIN_MOSI);
+  SPI1.setRX(PIN_MISO);
+  Serial.print(" MISO="); Serial.print(PIN_MISO);
+  //SPI.setCS(PIN_CSN); // Ensure CS/SS uses the correct GPIO (GPn)
+
+  SPI1.begin();
+  Serial.println("SETUP_LOG: SPI.begin() done");
 
 #if RADIO_ENABLED
+  Serial.println("SETUP_LOG: about to initRadio()");
   initRadio();
+  Serial.println("SETUP_LOG: returned from initRadio()");
 #if DISPLAY_ENABLED
   Wire1.end();
   delay(10);
@@ -490,12 +638,13 @@ void setup() {
   Serial.println("DISPLAY_DISABLED: Skipping OLED re-init.");
 #endif
 
-#if TEST_TX_MODE
+if (testTxMode) {
   Serial.println("TEST_TX_MODE enabled: sending random payloads at each frequency");
   scheduleStatus("TX TEST MODE", 1500);
-  // Seed RNG for payload generation
+  // Seed RNG for payload generation - already seeded on toggle, but ensure here too
   randomSeed(millis());
-#endif
+  Serial.println("SETUP_LOG: TEST_TX_MODE active");
+}
 
 #else
   Serial.println("RADIO DISABLED: Skipping radio init.");
@@ -511,6 +660,9 @@ void setup() {
   }
   lastSmoothMillis = millis();
   lastDisplayMs = millis();
+  // Ensure LED is set to the correct mode on startup
+  updateLedState();
+  Serial.println("SETUP_LOG: updateLedState done - setup complete");
   delay(500);
 }
 
@@ -530,17 +682,20 @@ void loop() {
 
   // Check Radio Reset Button
   if (digitalRead(BTN1) == LOW) {
-      Serial.println("Button 1 Pressed: Resetting Radio...");
-      if (oledReady) {
-        scheduleStatus("Resetting Radio...", 800);
+      // Toggle TX test mode with the button
+      testTxMode = !testTxMode;
+      if (testTxMode) {
+        Serial.println("Button 1 Pressed: ENTERING TX TEST MODE");
+        scheduleStatus("TX MODE", 800);
+        // Seed RNG for payloads
+        randomSeed(millis());
+      } else {
+        Serial.println("Button 1 Pressed: ENTERING RX MODE");
+        scheduleStatus("RX MODE", 800);
       }
-#if RADIO_ENABLED
-      initRadio();
-      Serial.println("Radio Reset Complete");
-#else
-      Serial.println("Radio disabled; skipping reset.");
-      if (oledReady) scheduleStatus("RADIO DISABLED", 800);
-#endif
+
+      // Update LED to reflect new mode
+      updateLedState();
       delay(500);
   }
 
@@ -559,41 +714,85 @@ void loop() {
       lastHeartbeat = millis();
   }
 
-  // If the CSV is near full, pause scanning and give the user a chance to
-  // download or reset the logs. Switch to blue LED while paused.
+  // If storage is low, log diagnostic info but do NOT pause scans or change
+  // the main LED state — just notify so the user can act.
   if (isCsvNearFull()) {
-    Serial.println("STORAGE WARNING: CSV near or at capacity. Pausing scans for 5 minutes.");
-    if (oledReady) scheduleStatus("STORAGE FULL", 4000);
-
-    // Set LED to blue to indicate storage-full
-    digitalWrite(LED_PIN_R, LOW);
-    digitalWrite(LED_PIN_G, LOW);
-    digitalWrite(LED_PIN_B, HIGH);
-
-    unsigned long pauseUntil = millis() + (5UL * 60UL * 1000UL); // 5 minutes
-    while (millis() < pauseUntil) {
-      // Keep watchdog happy and allow CSV reset via button
-      rp2040.wdt_reset();
-      if (digitalRead(BTN2) == LOW) {
-        Serial.println("CSV Reset pressed during storage pause — resetting now.");
-        resetCSV();
-        break; // exit pause early
-      }
-      delay(1000);
+#if defined(LittleFS) && defined(LITTLEFS)
+    size_t total = LittleFS.totalBytes();
+    size_t used = LittleFS.usedBytes();
+    size_t freeBytes = (total > used) ? (total - used) : 0;
+    Serial.print("STORAGE WARNING: Free bytes = "); Serial.print(freeBytes);
+    Serial.print(" / total = "); Serial.print(total);
+    Serial.print(" used = "); Serial.println(used);
+#else
+    // Fallback: print sizes of known CSV files
+    size_t s1 = 0, s2 = 0;
+    if (LittleFS.exists("/scan_log.csv")) {
+      File f1 = LittleFS.open("/scan_log.csv", "r");
+      if (f1) { s1 = f1.size(); f1.close(); }
     }
+    if (LittleFS.exists("/scan_log_fake.csv")) {
+      File f2 = LittleFS.open("/scan_log_fake.csv", "r");
+      if (f2) { s2 = f2.size(); f2.close(); }
+    }
+    Serial.print("STORAGE WARNING: CSV sizes -> scan_log.csv="); Serial.print(s1);
+    Serial.print(" bytes, scan_log_fake.csv="); Serial.print(s2); Serial.println(" bytes");
+#endif
+    // Brief status message on the display (if available)
+    if (oledReady) scheduleStatus("LOW STORAGE", 2000);
 
-    // Restore normal LED to green
-    digitalWrite(LED_PIN_B, LOW);
-    digitalWrite(LED_PIN_R, LOW);
-    digitalWrite(LED_PIN_G, HIGH);
+    // Do NOT pause scans or force LED to blue; allow scanning to continue.
   }
 
+  // Optional debug probe: check 907.000 MHz for 5s and verify a strong signal
+  // If DEBUG_907 is enabled and no signal >= -73 dBm is observed, skip the
+  // full sweep to avoid flooding logs with meaningless data.
   float maxRssiThisSweep = -150.0;
   float maxRssiFreq = 0;
   int rssiLogsThisSweep = 0;
+
+#if defined(DEBUG_907) && DEBUG_907
+  Serial.println("DEBUG_907: probing 907.000 MHz for 5 seconds...");
+  if (RADIO_ENABLED) {
+    unsigned long probeEnd = millis() + 5000;
+    float debugMax = -200.0f;
+    while (millis() < probeEnd) {
+      rp2040.wdt_reset();
+      radio.setFrequency(907.0f);
+      delayMicroseconds(200); // allow PLL/RX to settle
+      int16_t s = radio.startReceive();
+      if (s == RADIOLIB_ERR_NONE) {
+        delayMicroseconds(200);
+        float r = radio.getRSSI();
+        if (r > debugMax) debugMax = r;
+      }
+      // small pause to avoid hammering the radio
+      delay(50);
+    }
+
+    Serial.print("DEBUG_907: max RSSI seen = "); Serial.print(debugMax); Serial.println(" dBm");
+    if (debugMax < -73.0f) {
+      Serial.println("DEBUG_907: No strong debug signal found; skipping sweep and logging failure");
+      // Log a failure row so the host can see the diagnostic
+      logData(907.0f, debugMax, nullptr, 0);
+      // back off a bit to avoid tight-looping
+      delay(2000);
+      return; // skip the sweep this iteration (exit loop() so Arduino will call it again)
+    } else {
+      Serial.println("DEBUG_907: Debug signal found; proceeding with sweep");
+    }
+  } else {
+    Serial.println("DEBUG_907: RADIO_DISABLED - skipping debug probe");
+  }
+#endif
   
 #if RADIO_ENABLED
   // Sweep Loop - scan all 128 frequencies
+  // Open CSV once per sweep to avoid repeated open/close overhead.
+  File sweepLog = LittleFS.open(LOG_FILENAME, "a");
+  if (!sweepLog) {
+    Serial.println("Warning: could not open CSV for sweep logging");
+  }
   for (int i = 0; i < SCREEN_WIDTH; i++) {
     checkForSerialCommand();
     rp2040.wdt_reset();
@@ -604,9 +803,10 @@ void loop() {
     radio.setFrequency(currentFreq);
 
     // CRITICAL FIX: Give radio time to settle on new frequency
-    delayMicroseconds(10); // Allow PLL to lock
+    // Increased from 10us to 200us to allow the PLL & RX path to stabilize
+    delayMicroseconds(200); // Allow PLL to lock and RSSI to stabilize
 
-#if TEST_TX_MODE
+if (testTxMode) {
     // Transmit random payload at full configured power on this frequency
     radio.setOutputPower(RADIO_TX_POWER_DBM);
     const int TX_LEN = 16;
@@ -616,25 +816,33 @@ void loop() {
     int16_t txState = radio.transmit(txBuf, TX_LEN);
     if (txState == RADIOLIB_ERR_NONE) {
       // record transmit attempt into CSV (rssi not applicable)
-      logData(currentFreq, 0.0f, txBuf, TX_LEN);
-      // short visual feedback
-      digitalWrite(LED_PIN_R, HIGH);
-      delay(8);
-      digitalWrite(LED_PIN_R, LOW);
+      if (sweepLog) logData(sweepLog, currentFreq, 0.0f, txBuf, TX_LEN);
+      consecutiveTxErrors = 0;
     } else {
-      Serial.print("TX ERROR: "); Serial.println(txState);
+      Serial.print("TX ERROR: "); Serial.print(txState);
+      Serial.print(" -> "); Serial.println(radioErrorName(txState));
+      consecutiveTxErrors++;
+      // After repeated errors, reinitialize radio and back off briefly
+      if (consecutiveTxErrors >= 8) {
+        Serial.println("Multiple TX errors; reinitializing radio");
+        scheduleStatus("RADIO RESET", 1000);
+        initRadio();
+        consecutiveTxErrors = 0;
+        delay(200);
+      }
     }
 
-    // small settle time
-    delayMicroseconds(50);
+    // small settle time — increase to 5 ms to avoid hammering the radio
+    delay(5);
     // mark no received RSSI
     rssiData[i] = -150.0;
-#else
+} else {
     int16_t state = radio.startReceive();
 
     if (state == RADIOLIB_ERR_NONE) {
       // CRITICAL FIX: Longer settling time for accurate RSSI
-      delayMicroseconds(10); // Wait 10us for RSSI to stabilize
+      // Increased to 200us to prevent erratic spikes and false logs
+      delayMicroseconds(200); // Wait 200us for RSSI to stabilize
       float rssi = radio.getRSSI(); 
       rssiData[i] = rssi;
       
@@ -645,8 +853,7 @@ void loop() {
 
       // DATA SNIFFER LOGIC
       if (rssi > -60.0) {
-          digitalWrite(LED_PIN_B, HIGH);
-          
+          // Log packet when found; do not change LED here to avoid flicker
           size_t len = radio.getPacketLength(); 
           String strData;
           rp2040.wdt_reset();
@@ -654,41 +861,29 @@ void loop() {
           rp2040.wdt_reset();
 
           if (rxState == RADIOLIB_ERR_NONE) {
-             logData(currentFreq, rssi, (uint8_t*)strData.c_str(), strData.length());
-             digitalWrite(LED_PIN_G, HIGH);
-             delay(50);
-             digitalWrite(LED_PIN_G, LOW);
+             if (sweepLog) logData(sweepLog, currentFreq, rssi, (uint8_t*)strData.c_str(), strData.length());
+             // Could schedule a brief status instead of LED flash
+             if (oledReady) scheduleStatus("PKT RX", 500);
           } else {
-             logData(currentFreq, rssi, nullptr, 0);
+             if (sweepLog) logData(sweepLog, currentFreq, rssi, nullptr, 0);
           }
-           digitalWrite(LED_PIN_B, LOW);
       } else if (rssi > RSSI_THRESHOLD_DBM) {
-          logData(currentFreq, rssi, nullptr, 0);
+          if (sweepLog) logData(sweepLog, currentFreq, rssi, nullptr, 0);
           rssiLogsThisSweep++;
-      }
-      
-      // LED Logic
-      if (rssi > (globalMaxRssiLog + 6.0)) {
-        redLedUntil = millis() + 1000;
-      }
-
-      if (millis() < redLedUntil) {
-        digitalWrite(LED_PIN_R, HIGH);
-        digitalWrite(LED_PIN_G, LOW);
-        digitalWrite(LED_PIN_B, LOW);
-      } else {
-        digitalWrite(LED_PIN_R, LOW);
-        digitalWrite(LED_PIN_G, HIGH);
-        digitalWrite(LED_PIN_B, LOW);
       }
 
     } else {
       rssiData[i] = -150.0;
     }
-#endif
-  }
+    
+    } // end receive branch
+  
+  } // end sweep for-loop
+  if (sweepLog) sweepLog.close();
 #else
   // Fake mode: simulate a quick sweep filling rssiData[] with generated values and occasional logs
+  File sweepLog = LittleFS.open(LOG_FILENAME, "a");
+  if (!sweepLog) Serial.println("Warning: could not open CSV for sweep logging (fake)");
   for (int i = 0; i < SCREEN_WIDTH; i++) {
     checkForSerialCommand();
     rp2040.wdt_reset();
@@ -707,37 +902,29 @@ void loop() {
     if ((i % 40) == ((unsigned long)(t) % 40)) {
       rssi = -45.0f;
       rssiData[i] = rssi;
-      logData(currentFreq, rssi, nullptr, 0);
+      if (sweepLog) logData(sweepLog, currentFreq, rssi, nullptr, 0);
       if (rssi > maxRssiThisSweep) {
         maxRssiThisSweep = rssi;
         maxRssiFreq = currentFreq;
       }
     } else if (rssi > RSSI_THRESHOLD_DBM) {
-      logData(currentFreq, rssi, nullptr, 0);
+      if (sweepLog) logData(sweepLog, currentFreq, rssi, nullptr, 0);
       rssiLogsThisSweep++;
     }
 
-    // LED Logic (same behavior)
-    if (rssi > (globalMaxRssiLog + 6.0)) {
-      redLedUntil = millis() + 1000;
-    }
-
-    if (millis() < redLedUntil) {
-      digitalWrite(LED_PIN_R, HIGH);
-      digitalWrite(LED_PIN_G, LOW);
-      digitalWrite(LED_PIN_B, LOW);
-    } else {
-      digitalWrite(LED_PIN_R, LOW);
-      digitalWrite(LED_PIN_G, HIGH);
-      digitalWrite(LED_PIN_B, LOW);
-    }
+    // No per-sample LED changes in fake mode either; defer to updateLedState
+    (void)0; // noop placeholder
 
     // small throttle to simulate scanning time
     delayMicroseconds(50);
   }
   // short delay to emulate total scan time
+  if (sweepLog) sweepLog.close();
   delay(20);
 #endif
+
+  // Ensure LED matches current mode (no per-sample flicker)
+  updateLedState();
   
   // Update global max tracking
   if (maxRssiThisSweep > globalMaxRssiLog) {
